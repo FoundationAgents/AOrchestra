@@ -42,9 +42,15 @@ Our core claim is that agent orchestration becomes modular, controllable, and pl
 ```bash
 # 1) Install
 conda create -n orchestra python=3.13 && conda activate orchestra
+
+# 2) Config packages
+pip install poetry
+poetry install
+
+or just sample config
 pip install -r requirements.txt
 
-# 2) Configure
+# 3) Config  ENV
 cp .env.example .env
 cp config/example/model_config.yaml config/
 cp -r config/example/benchmarks config/
