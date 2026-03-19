@@ -69,14 +69,15 @@ class ExecuteCodeAction(BaseAction):
         return {"success": ok, "output": stdout.decode("utf-8", "replace"), "error": None if ok else stderr.decode("utf-8", "replace"), "metrics": {}}
 
     async def _exec_python(self, code: str, timeout: int) -> Dict[str, Any]:
-        # write to temp file under workspace
         base = os.path.abspath(os.getcwd())
         tmpdir = os.path.join(base, "workspace", ".exec")
         os.makedirs(tmpdir, exist_ok=True)
+        downloads_dir = os.path.join(base, "workspace", "tmp")
+        os.makedirs(downloads_dir, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode="w", delete=False, dir=tmpdir, suffix=".py") as tf:
             tf.write(code)
             path = tf.name
-        cmd = f"python '{path}'"
+        cmd = f"DOWNLOAD_DIR='{downloads_dir}' python '{path}'"
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
