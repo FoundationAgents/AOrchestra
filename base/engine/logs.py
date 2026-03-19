@@ -37,7 +37,7 @@ class SimpleLogger:
     
     def __init__(
         self, 
-        name: str = "AutoEnv",
+        name: str = "AOrchestra",
         log_level: Union[int, LogLevel] = LogLevel.INFO,
         log_file: Optional[str] = None,
         log_dir: str = "workspace/logs",
