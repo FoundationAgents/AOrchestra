@@ -326,7 +326,7 @@ class GAIARunner:
                         file_name,
                         None,
                         None,
-                        [],
+                        attempts_detail,
                         False,
                         0.0,
                         0.0,

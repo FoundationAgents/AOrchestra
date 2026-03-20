@@ -12,7 +12,8 @@ from base.agent.memory import Memory
 from base.engine.async_llm import ModelPricing
 from base.engine.logs import logger, LogLevel
 from benchmark.common.env import BasicInfo
-from aorchestra.common.utils import parse_json_response, indent_text
+from aorchestra.common.utils import indent_text
+from base.engine.utils import parse_llm_action_response
 
 
 def build_model_pricing_table(
@@ -199,8 +200,8 @@ class MainAgent(BaseAgent):
         logger.warning(response_msg)
         logger.log_to_file(LogLevel.INFO, response_msg)
         
-        # Parse decision
-        decision = parse_json_response(resp)
+        # Parse decision (graceful fallback — never throws)
+        decision = parse_llm_action_response(resp)
         
         # Log parsed decision
         decision_msg = f"\n{'='*80}\n[MainAgent Attempt {self.attempt}] PARSED DECISION:\n{'='*80}\n{json.dumps(decision, indent=2, ensure_ascii=False)}\n{'='*80}\n"
