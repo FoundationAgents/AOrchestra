@@ -41,6 +41,12 @@ If you run out of steps without "finish", your work is lost and marked as timeou
 5. Once done, use 'finish' IMMEDIATELY with your best result
 6. You MUST ONLY use tools listed in Available Tools. Do NOT invent new tools.
 7. Pay attention to precision, units, and format requirements in the question
+8. Prefer PRIMARY SOURCES: download and read the actual document, webpage, subtitle file, or dataset rather than relying on search result snippets or secondary descriptions
+9. For calculation, counting, or filtering tasks, use ExecuteCodeAction and print intermediate values — do not estimate mentally
+10. For video/audio content questions, prefer extracting subtitles or transcripts over relying on web descriptions
+11. For tasks involving provided files (PDF, PPTX, Excel, etc.), inspect and extract content programmatically (e.g. python-pptx, openpyxl, PyPDF2) rather than guessing from descriptions
+12. For tasks requiring data from a specific website or database, navigate to the primary site or use its API directly rather than relying on search engine summaries
+13. Return the EXACT value from the source — do not paraphrase, change plural/singular forms, or round unless the question explicitly asks for it
 
 ⚠️ BUDGET: When remaining_steps <= 5, use 'finish' NOW!
 

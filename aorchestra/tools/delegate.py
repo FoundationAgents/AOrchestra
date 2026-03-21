@@ -185,7 +185,7 @@ class DelegateTaskTool(BaseAction):
                     finish_result = last.info["finish_result"]
             
             # 8. Summarize trace (using fixed gemini-3-flash-preview model)
-            trace_summary = await self._summarize_trace(result.trace, task_instruction)
+            trace_summary = await self._summarize_trace(result.trace, task_instruction, finish_result)
             
             # Convert StepRecord objects to dicts for JSON serialization
             trace_serializable = [_make_serializable(step) for step in result.trace] if result.trace else []
@@ -317,31 +317,48 @@ class DelegateTaskTool(BaseAction):
             end_time=end_time,
         )
 
-    async def _summarize_trace(self, trace, task_instruction: str) -> str:
+    async def _summarize_trace(self, trace, task_instruction: str, finish_result: dict = None) -> str:
         """Summarize execution trace (using fixed gemini-3-flash-preview model)"""
         if not trace:
             return "No steps executed"
-        
+
         trace_text = self._trace_formatter.format_trace(trace)
-        
+
         # Select different summary prompt based on benchmark_type
         if self.benchmark_type == "gaia":
             original_question = getattr(self.env, 'instruction', '') or task_instruction
-            prompt = f"""You are a trajectory summarizer. Review the SubAgent's execution trace. Compare the execution trace against the original task requirements.
+            # Include finish_result so the summarizer knows the final output
+            finish_section = ""
+            if finish_result:
+                fr_result = finish_result.get("result", "")
+                fr_status = finish_result.get("status", "")
+                finish_section = f"""
+== SUBAGENT FINAL OUTPUT ==
+Status: {fr_status}
+Result: {fr_result}
+"""
+            prompt = f"""You are a neutral trajectory summarizer. Your job is to objectively describe what the SubAgent did and found, NOT to judge whether it succeeded or failed.
 
 == ORIGINAL TASK ==
 {original_question}
-
+{finish_section}
 == EXECUTION TRACE ==
 {trace_text}
 
-== OUTPUT ==
-Based on the trace, answer:
-1. ✅ COMPLETED: What requirements from the original task were actually done?
-2. ❌ REMAINING: What requirements are still missing or not properly tested?
+== INSTRUCTIONS ==
+Summarize the SubAgent's execution in 3-7 neutral bullets:
+- What information sources were consulted (URLs, APIs, files, tools used)
+- What key data points or intermediate findings were obtained
+- What the SubAgent's final answer/conclusion was and how it arrived there
+- Any notable obstacles encountered (errors, timeouts, access issues)
 
-Summarize in 5-10 bullets: key progress, problems, remaining issues.
-Be specific and concise. Output ONLY the two sections above."""
+IMPORTANT RULES:
+- Be factual and objective. Do NOT editorialize about quality or completeness.
+- Do NOT contradict the SubAgent's final output shown above. If the SubAgent produced a result, report it as-is.
+- Do NOT speculate about whether the result is correct or incorrect.
+- Focus on WHAT was done and found, not on what was NOT done.
+
+Output ONLY the bullet-point summary."""
         elif self.benchmark_type == "swebench":
             original_question = getattr(self.env, 'instruction', '') or task_instruction
             prompt = f"""You are a trajectory summarizer for a SWE-bench task (GitHub issue fixing).

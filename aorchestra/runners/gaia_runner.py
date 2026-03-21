@@ -221,7 +221,25 @@ class GAIARunner:
                         if action_name == "complete":
                             final_answer = params.get("answer")
                             break
-                    
+
+                    # Fallback: if MainAgent never called complete, pick the most common "done" result
+                    if final_answer is None and attempts_detail:
+                        from collections import Counter
+                        done_results = [
+                            a.get("result", {}).get("finish_result", {}).get("result", "")
+                            for a in attempts_detail
+                            if a.get("action") == "delegate_task"
+                            and a.get("result", {}).get("finish_result", {}).get("status") == "done"
+                            and a.get("result", {}).get("finish_result", {}).get("result")
+                            and a.get("result", {}).get("finish_result", {}).get("result") != "-"
+                        ]
+                        if done_results:
+                            final_answer = Counter(done_results).most_common(1)[0][0]
+                            logger.warning(
+                                f"[GAIA] MainAgent never called complete. "
+                                f"Fallback: using most common done result: {final_answer}"
+                            )
+
                     main_cost_after = main_agent.get_usage_cost()
                     main_cost = max(0.0, main_cost_after - main_cost_before)
 
