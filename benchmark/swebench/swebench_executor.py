@@ -1,278 +1,136 @@
-"""SWE-bench executor - based on official swebench harness implementation."""
+"""SWE-bench executor.
+
+Grading and eval-script construction delegate to the official ``swebench``
+package (``swebench.harness.{grading, log_parsers, constants, test_spec}``).
+The in-tree grader that previously lived here was inconsistent with the
+official harness (see swebench_grader_audit.md); calling upstream directly
+ensures the per-(repo, version) test commands, the per-repo log parsers, and
+the FAIL_TO_PASS / PASS_TO_PASS classification all match the published
+benchmark.
+"""
 import asyncio
-import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any
+
+from swebench.harness.constants import (
+    END_TEST_OUTPUT,
+    FAIL_ONLY_REPOS,
+    MAP_REPO_VERSION_TO_SPECS,
+    START_TEST_OUTPUT,
+    EvalType,
+    TestStatus,
+)
+from swebench.harness.grading import test_failed as _official_test_failed
+from swebench.harness.grading import test_passed as _official_test_passed
+from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
+from swebench.harness.test_spec.python import make_eval_script_list_py
 
 from base.engine.logs import logger
 from benchmark.swebench.data_loader import SWEBenchInstance
 
-# ============================================================================
-# Constants from official swebench (swebench/harness/constants.py)
-# ============================================================================
 
-START_TEST_OUTPUT = ">>>>> Start Test Output"
-END_TEST_OUTPUT = ">>>>> End Test Output"
-
-NON_TEST_EXTS = [
-    ".json", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico",
-    ".txt", ".md", ".rst", ".csv", ".tsv", ".xml", ".yaml", ".yml",
-    ".toml", ".cfg", ".ini", ".conf", ".lock", ".log",
-]
-
-# Repository-specific test commands (simplified from MAP_REPO_VERSION_TO_SPECS)
-REPO_TEST_CMDS = {
-    "astropy/astropy": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "django/django": "./tests/runtests.py --verbosity 2 {tests}",
-    "matplotlib/matplotlib": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "pallets/flask": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "psf/requests": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "pylint-dev/pylint": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "pytest-dev/pytest": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "scikit-learn/scikit-learn": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "sphinx-doc/sphinx": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "sympy/sympy": "bin/test -C --verbose {tests}",
-    "pydata/xarray": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-    "mwaskom/seaborn": "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider",
-}
-
-DEFAULT_TEST_CMD = "python -m pytest {tests} --no-header -rA --tb=no -p no:cacheprovider"
+def _instance_to_dict(instance: SWEBenchInstance) -> Dict[str, Any]:
+    """Convert SWEBenchInstance dataclass to the dict shape upstream expects."""
+    data = asdict(instance)
+    data["FAIL_TO_PASS"] = list(instance.FAIL_TO_PASS or [])
+    data["PASS_TO_PASS"] = list(instance.PASS_TO_PASS or [])
+    return data
 
 
-# ============================================================================
-# Utility functions from official swebench
-# ============================================================================
-
-def get_modified_files(patch: str) -> List[str]:
-    """Extract list of modified files from a patch (from swebench/harness/utils.py)."""
-    diff_pat = r"diff --git a/.* b/(.*)"
-    return re.findall(diff_pat, patch)
-
-
-def get_test_directives(repo: str, test_patch: str) -> List[str]:
-    """
-    Get test directives from the test_patch of a task instance.
-    Based on swebench/harness/test_spec/python.py:get_test_directives
-    """
-    diff_pat = r"diff --git a/.* b/(.*)"
-    directives = re.findall(diff_pat, test_patch)
-    directives = [
-        d for d in directives if not any(d.endswith(ext) for ext in NON_TEST_EXTS)
-    ]
-    
-    # For Django tests, remove extension + "tests/" prefix and convert slashes to dots
-    if repo == "django/django":
-        directives_transformed = []
-        for d in directives:
-            d = d[: -len(".py")] if d.endswith(".py") else d
-            d = d[len("tests/") :] if d.startswith("tests/") else d
-            d = d.replace("/", ".")
-            directives_transformed.append(d)
-        directives = directives_transformed
-    
-    return directives
-
-
-def make_eval_script(
-    repo: str,
-    base_commit: str,
-    test_patch: str,
-    repo_directory: str = "/testbed",
-    env_name: str = "testbed",
-) -> str:
-    """
-    Generate evaluation script based on official swebench implementation.
-    Based on swebench/harness/test_spec/python.py:make_eval_script_list_py
-    """
-    HEREDOC_DELIMITER = "EOF_114329324912"
-    
-    # Get test files and directives
-    test_files = get_modified_files(test_patch) if test_patch else []
-    test_files_str = " ".join(test_files) if test_files else ""
-    
-    test_directives = get_test_directives(repo, test_patch) if test_patch else []
-    directives_str = " ".join(test_directives) if test_directives else ""
-    
-    # Get test command for repo
-    test_cmd_template = REPO_TEST_CMDS.get(repo, DEFAULT_TEST_CMD)
-    test_cmd = test_cmd_template.format(tests=directives_str)
-    
-    # Reset test files command
-    reset_tests_command = f"git checkout {base_commit} -- {test_files_str}" if test_files_str else ":"
-    
-    # Apply test patch command
-    apply_test_patch_command = (
-        f"git apply -v - <<'{HEREDOC_DELIMITER}'\n{test_patch}\n{HEREDOC_DELIMITER}"
-        if test_patch else ":"
-    )
-    
-    # Build eval script following official pattern
-    eval_commands = [
-        "#!/bin/bash",
-        "set -uxo pipefail",  # Don't use -e to allow tests to fail
-        "",
-        "# Activate conda environment",
-        "source /opt/miniconda3/bin/activate",
-        f"conda activate {env_name}",
-        f"cd {repo_directory}",
-        "",
-        f"git config --global --add safe.directory {repo_directory}",
-        f"cd {repo_directory}",
-        "",
-        "# Informational output",
-        "git status",
-        "git show --stat",
-        f"git -c core.fileMode=false diff {base_commit}",
-        "",
-        "# Re-activate environment",
-        "source /opt/miniconda3/bin/activate",
-        f"conda activate {env_name}",
-        "",
-        "# Reset test files to base commit state",
-        reset_tests_command,
-        "",
-        "# Apply test patch",
-        apply_test_patch_command,
-        "",
-        "# Run tests",
-        f": '{START_TEST_OUTPUT}'",
-        test_cmd,
-        f": '{END_TEST_OUTPUT}'",
-        "",
-        "# Revert test files",
-        reset_tests_command,
-    ]
-    
-    return "\n".join(eval_commands) + "\n"
-
-
-def parse_log_pytest(log: str) -> Dict[str, str]:
-    """
-    Parse pytest output log to get test status.
-    Based on swebench/harness/log_parsers/pytest_log_parser.py
-    """
-    test_status = {}
-    
-    # Pattern for pytest output: "test_file.py::test_name PASSED/FAILED/SKIPPED/ERROR"
-    pattern = r"^(.*?)\s+(PASSED|FAILED|SKIPPED|ERROR|XFAIL|XPASS)"
-    
-    for line in log.split("\n"):
-        match = re.match(pattern, line.strip())
-        if match:
-            test_name = match.group(1).strip()
-            status = match.group(2)
-            test_status[test_name] = status
-    
-    return test_status
-
-
-def parse_log_django(log: str) -> Dict[str, str]:
-    """
-    Parse Django test output log.
-    Based on swebench/harness/log_parsers/django_log_parser.py
-    """
-    test_status = {}
-    
-    # Pattern for Django output: "test_name (module.ClassName) ... ok/FAIL/ERROR"
-    pattern = r"^(test_\w+)\s+\(([^)]+)\)\s+\.\.\.\s+(ok|FAIL|ERROR|skipped)"
-    
-    for line in log.split("\n"):
-        match = re.match(pattern, line.strip())
-        if match:
-            test_name = f"{match.group(1)} ({match.group(2)})"
-            status_map = {"ok": "PASSED", "FAIL": "FAILED", "ERROR": "FAILED", "skipped": "SKIPPED"}
-            test_status[test_name] = status_map.get(match.group(3), "FAILED")
-    
-    return test_status
-
-
-def get_eval_tests_report(
+def _grade_test_output(
     test_output: str,
-    repo: str,
-    fail_to_pass: List[str],
-    pass_to_pass: List[str],
-) -> Dict[str, Any]:
-    """
-    Parse test output and generate evaluation report.
-    Based on swebench/harness/grading.py
-    """
-    # Extract test output between markers
-    start_idx = test_output.find(START_TEST_OUTPUT)
-    end_idx = test_output.find(END_TEST_OUTPUT)
-    
-    if start_idx != -1 and end_idx != -1:
-        test_log = test_output[start_idx:end_idx]
-    else:
-        test_log = test_output
-    
-    # Parse based on repo type
-    if repo == "django/django":
-        test_status = parse_log_django(test_log)
-    else:
-        test_status = parse_log_pytest(test_log)
-    
-    # Classify results
-    results = {
-        "FAIL_TO_PASS": {"success": [], "failure": []},
-        "PASS_TO_PASS": {"success": [], "failure": []},
-    }
-    
-    def test_passed(test_name: str) -> bool:
-        """Check if a test passed by matching against parsed status."""
-        # Direct match
-        if test_name in test_status:
-            return test_status[test_name] == "PASSED"
-        
-        # Partial match - check if test name is contained in any key
-        for key, status in test_status.items():
-            if test_name in key or key in test_name:
-                return status == "PASSED"
-            # Also check just the method name
-            test_method = test_name.split("::")[-1] if "::" in test_name else test_name.split(".")[-1]
-            if test_method in key:
-                return status == "PASSED"
-        
-        # Check for overall pass (e.g., "OK" at end for Django, or "X passed" for pytest)
-        if "OK" in test_log.split("\n")[-10:]:
-            return True
-        if re.search(r"\d+ passed", test_log):
-            return True
-        
-        return False
-    
-    def test_failed(test_name: str) -> bool:
-        """Check if a test failed."""
-        if test_name in test_status:
-            return test_status[test_name] == "FAILED"
-        
-        for key, status in test_status.items():
-            if test_name in key or key in test_name:
-                return status == "FAILED"
-            test_method = test_name.split("::")[-1] if "::" in test_name else test_name.split(".")[-1]
-            if test_method in key:
-                return status == "FAILED"
-        
-        return False
-    
-    # Classify FAIL_TO_PASS tests
-    for test in fail_to_pass or []:
-        if test_passed(test):
-            results["FAIL_TO_PASS"]["success"].append(test)
-        else:
-            results["FAIL_TO_PASS"]["failure"].append(test)
-    
-    # Classify PASS_TO_PASS tests
-    for test in pass_to_pass or []:
-        if test_failed(test):
-            results["PASS_TO_PASS"]["failure"].append(test)
-        else:
-            results["PASS_TO_PASS"]["success"].append(test)
-    
-    return results
+    instance: SWEBenchInstance,
+) -> Dict[str, Dict[str, list]]:
+    """Parse a captured eval-script log and classify F2P / P2P verdicts.
 
+    Mirrors the official ``grading.get_logs_eval`` + ``get_eval_tests_report``
+    pipeline but operates on an in-memory string (we already have the log) and
+    skips the file-IO indirection.
+    """
+    repo = instance.repo
+    parser = MAP_REPO_TO_PARSER.get(repo)
+    if parser is None:
+        raise KeyError(
+            f"No upstream log parser registered for repo {repo!r}; "
+            f"is the instance from a newer swebench split than the installed package?"
+        )
+
+    if START_TEST_OUTPUT in test_output and END_TEST_OUTPUT in test_output:
+        test_content = test_output.split(START_TEST_OUTPUT, 1)[1].split(END_TEST_OUTPUT, 1)[0]
+    else:
+        # Markers missing → patch apply / reset / harness failure. Upstream treats
+        # this as "patch did not apply"; we return empty status_map so every
+        # FAIL_TO_PASS test is marked failure (and PASS_TO_PASS is excluded).
+        test_content = ""
+
+    status_map = parser(test_content, None) if test_content else {}
+
+    eval_type = EvalType.FAIL_ONLY if repo in FAIL_ONLY_REPOS else EvalType.PASS_AND_FAIL
+
+    def _check(test_case: str, success: list, failed: list) -> None:
+        if eval_type == EvalType.FAIL_ONLY:
+            if (
+                test_case in status_map
+                and status_map[test_case] == TestStatus.FAILED.value
+            ):
+                failed.append(test_case)
+            else:
+                success.append(test_case)
+        else:
+            if _official_test_passed(test_case, status_map):
+                success.append(test_case)
+            elif _official_test_failed(test_case, status_map):
+                failed.append(test_case)
+            # Tests that are neither demonstrably passed nor failed are dropped,
+            # matching upstream's ``check_pass_and_fail``.
+
+    f2p_success: list = []
+    f2p_failure: list = []
+    for case in instance.FAIL_TO_PASS or []:
+        _check(case, f2p_success, f2p_failure)
+
+    p2p_success: list = []
+    p2p_failure: list = []
+    for case in instance.PASS_TO_PASS or []:
+        _check(case, p2p_success, p2p_failure)
+
+    return {
+        "FAIL_TO_PASS": {"success": f2p_success, "failure": f2p_failure},
+        "PASS_TO_PASS": {"success": p2p_success, "failure": p2p_failure},
+    }
+
+
+def _build_eval_script(instance: SWEBenchInstance, repo_directory: str) -> str:
+    """Build the bash eval script via upstream ``make_eval_script_list_py``.
+
+    Upstream's script activates conda, applies the test patch, runs the
+    per-(repo, version) ``test_cmd`` from ``MAP_REPO_VERSION_TO_SPECS``,
+    wraps the test output between the ``START_TEST_OUTPUT`` / ``END_TEST_OUTPUT``
+    sentinels, then reverts the test files.
+    """
+    instance_dict = _instance_to_dict(instance)
+    try:
+        specs = MAP_REPO_VERSION_TO_SPECS[instance.repo][instance.version]
+    except KeyError as e:
+        raise KeyError(
+            f"No specs for ({instance.repo!r}, version={instance.version!r}) in "
+            f"upstream MAP_REPO_VERSION_TO_SPECS"
+        ) from e
+
+    env_name = "testbed"
+    eval_commands = make_eval_script_list_py(
+        instance_dict,
+        specs,
+        env_name,
+        repo_directory,
+        instance.base_commit,
+        instance.test_patch or "",
+    )
+    return "\n".join(["#!/bin/bash", "set -uxo pipefail", *eval_commands]) + "\n"
 
 
 class SWEBenchExecutor:
@@ -484,52 +342,43 @@ class SWEBenchExecutor:
 
     async def run_tests(self) -> Tuple[float, Dict[str, Any]]:
         """Run tests and return reward and details.
-        
-        Based on official swebench harness implementation.
+
+        Eval script is built by ``swebench.harness.test_spec.python.make_eval_script_list_py``
+        and grading is done by ``swebench.harness.grading`` (via ``_grade_test_output``),
+        so the verdict matches the official harness.
         """
         if not self.container_id:
             raise RuntimeError("Container not started")
-        
-        # Generate eval script using built-in implementation
-        eval_script = make_eval_script(
-            repo=self.instance.repo,
-            base_commit=self.instance.base_commit,
-            test_patch=self.instance.test_patch or "",
-            repo_directory=self._repo_path,
-            env_name="testbed",
-        )
-        
+
+        # Build eval script via upstream
+        eval_script = _build_eval_script(self.instance, self._repo_path)
+
         # Save eval script to log for debugging
         eval_script_log = self.logs_dir / "eval.sh"
         with eval_script_log.open("w", encoding="utf-8") as f:
             f.write(eval_script)
-        
+
         # Write eval script to container and execute
         await self.execute_command(
             f"cat > /eval.sh << 'EOF_EVAL_SCRIPT'\n{eval_script}\nEOF_EVAL_SCRIPT"
         )
         await self.execute_command("chmod +x /eval.sh")
-        
+
         # Run eval script with extended timeout for test execution
         test_output, exit_code = await self.execute_command(
             "/bin/bash /eval.sh",
             timeout=self.timeout,
         )
-        
+
         # Save test output to log
         test_output_log = self.logs_dir / "test_output.txt"
         with test_output_log.open("w", encoding="utf-8") as f:
             f.write(test_output)
-        
-        # Parse results using built-in implementation
-        test_results = get_eval_tests_report(
-            test_output=test_output,
-            repo=self.instance.repo,
-            fail_to_pass=self.instance.FAIL_TO_PASS,
-            pass_to_pass=self.instance.PASS_TO_PASS,
-        )
-        
-        # Build results dict
+
+        # Grade using upstream parsers + grading semantics
+        test_results = _grade_test_output(test_output, self.instance)
+
+        # Build results dict (keep field names stable for downstream consumers)
         results = {
             "fail_to_pass": {
                 "passed": test_results["FAIL_TO_PASS"]["success"],
@@ -540,38 +389,49 @@ class SWEBenchExecutor:
                 "failed": test_results["PASS_TO_PASS"]["failure"],
             },
         }
-        
-        # Calculate reward
-        fail_to_pass_total = len(self.instance.FAIL_TO_PASS) if self.instance.FAIL_TO_PASS else 0
-        fail_to_pass_success = len(results["fail_to_pass"]["passed"])
-        pass_to_pass_total = len(self.instance.PASS_TO_PASS) if self.instance.PASS_TO_PASS else 0
-        pass_to_pass_success = len(results["pass_to_pass"]["passed"])
-        
-        all_f2p_pass = fail_to_pass_success == fail_to_pass_total if fail_to_pass_total > 0 else True
-        all_p2p_pass = pass_to_pass_success == pass_to_pass_total if pass_to_pass_total > 0 else True
+
+        # Compute resolution (matches upstream ``get_resolution_status`` FULL):
+        #   resolved iff every gold F2P test passed AND every gold P2P test passed.
+        # When upstream's check_pass_and_fail drops a test (neither passed nor
+        # failed in the parsed log), it falls out of both lists. We treat the
+        # gold totals as the denominator: a dropped test counts as failure for
+        # F2P (the patch did not demonstrate the bug was fixed) and is excluded
+        # for P2P (matches upstream's compute_pass_to_pass).
+        f2p_total = len(self.instance.FAIL_TO_PASS or [])
+        f2p_success = len(results["fail_to_pass"]["passed"])
+        p2p_classified = (
+            len(results["pass_to_pass"]["passed"])
+            + len(results["pass_to_pass"]["failed"])
+        )
+        p2p_success = len(results["pass_to_pass"]["passed"])
+
+        all_f2p_pass = (f2p_success == f2p_total) if f2p_total > 0 else True
+        all_p2p_pass = (p2p_success == p2p_classified) if p2p_classified > 0 else True
         resolved = all_f2p_pass and all_p2p_pass
         reward = 1.0 if resolved else 0.0
-        
+
         results["reward"] = reward
+        # ``pass_to_pass`` denominator follows upstream: only count tests we
+        # actually saw a verdict for, not the gold-list size.
         results["summary"] = {
-            "fail_to_pass": f"{fail_to_pass_success}/{fail_to_pass_total}",
-            "pass_to_pass": f"{pass_to_pass_success}/{pass_to_pass_total}",
+            "fail_to_pass": f"{f2p_success}/{f2p_total}",
+            "pass_to_pass": f"{p2p_success}/{p2p_classified}",
         }
-        
+
         # Save test results to log
         test_log = self.logs_dir / "test_results.log"
         with test_log.open("w", encoding="utf-8") as f:
             f.write(f"Instance: {self.instance.instance_id}\n")
             f.write(f"Resolved: {resolved}\n")
             f.write(f"Reward: {reward}\n")
-            f.write(f"FAIL_TO_PASS: {fail_to_pass_success}/{fail_to_pass_total}\n")
-            f.write(f"PASS_TO_PASS: {pass_to_pass_success}/{pass_to_pass_total}\n")
+            f.write(f"FAIL_TO_PASS: {f2p_success}/{f2p_total}\n")
+            f.write(f"PASS_TO_PASS: {p2p_success}/{p2p_classified}\n")
             f.write(f"\nDetailed results:\n")
             f.write(f"F2P passed: {results['fail_to_pass']['passed']}\n")
             f.write(f"F2P failed: {results['fail_to_pass']['failed']}\n")
             f.write(f"P2P passed: {results['pass_to_pass']['passed']}\n")
             f.write(f"P2P failed: {results['pass_to_pass']['failed']}\n")
-        
+
         return reward, results
 
     async def get_file_content(self, file_path: str) -> Tuple[str, int]:

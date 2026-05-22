@@ -41,6 +41,7 @@ class SWEBenchSubAgentRunner(Runner):
 
             history = []
             total_reward = 0.0
+            graded_reward: Optional[float] = None
             max_steps = info.max_steps
 
             for t in range(max_steps):
@@ -94,21 +95,29 @@ class SWEBenchSubAgentRunner(Runner):
 
                 obs_next, reward, done, step_info = await env.step(action)
 
+                step_graded = bool(
+                    step_info.get("submitted") or step_info.get("max_steps_reached")
+                )
+
                 step_record = StepRecord(
                     observation=obs,
                     action=action,
-                    reward=reward,
+                    reward=reward if step_graded else 0.0,
                     raw_response=raw_response,
                     done=done,
                     info=step_info,
                     raw_input=raw_input,
                 )
                 history.append(step_record)
-                total_reward += reward
+                if step_graded:
+                    graded_reward = float(reward)
                 obs = obs_next
 
                 if done:
                     break
+
+            if graded_reward is not None:
+                total_reward = graded_reward
 
             usage_summary = agent.llm.get_usage_summary()
             result = LevelResult(
@@ -121,7 +130,12 @@ class SWEBenchSubAgentRunner(Runner):
                 input_tokens=usage_summary.get("total_input_tokens", 0),
                 output_tokens=usage_summary.get("total_output_tokens", 0),
             )
-            logger.info(f"[SWEBenchSubAgentRunner] SubAgent completed: steps={result.steps}, reward={result.total_reward}")
+            reward_repr = (
+                f"{result.total_reward:.4f}"
+                if graded_reward is not None
+                else "n/a (not graded)"
+            )
+            logger.info(f"[SWEBenchSubAgentRunner] SubAgent completed: steps={result.steps}, reward={reward_repr}")
             return result
             
         except Exception as e:
@@ -206,14 +220,17 @@ class SWEBenchRunner(Runner):
                 
                 action_name = action.get("action")
                 result = action.get("result", {})
-                reward = result.get("reward", 0.0)
                 step_done = result.get("done", False)
                 is_submit = action_name == "submit"
-                
+                # Only submit produces a real graded reward; other actions
+                # (delegate_task, etc.) have no reward signal — record 0.0 to
+                # avoid implying the grader judged a score it never ran.
+                reward = float(result.get("reward", 0.0)) if is_submit else 0.0
+
                 if action_name == "delegate_task":
                     sub_cost = result.get("cost", 0.0)
                     total_sub_cost += sub_cost
-                
+
                 history.append(StepRecord(
                     observation={},
                     action=action,
@@ -222,7 +239,7 @@ class SWEBenchRunner(Runner):
                     done=step_done,
                     info=result,
                 ))
-                
+
                 if is_submit:
                     total_reward = reward
                 
@@ -238,8 +255,8 @@ class SWEBenchRunner(Runner):
                 
                 if container_ready and executor and hasattr(executor, "run_tests"):
                     try:
-                        reward = await executor.run_tests()
-                        total_reward = float(reward if isinstance(reward, (int, float)) else 0.0)
+                        reward, _ = await executor.run_tests()
+                        total_reward = float(reward)
                         done = True
                     except Exception as e:
                         logger.error(f"[SWEBenchOrchestra] Forced submit failed: {e}")
