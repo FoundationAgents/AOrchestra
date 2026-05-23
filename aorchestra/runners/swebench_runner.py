@@ -230,6 +230,12 @@ class SWEBenchRunner(Runner):
                 if action_name == "delegate_task":
                     sub_cost = result.get("cost", 0.0)
                     total_sub_cost += sub_cost
+                    if hasattr(env, "get_current_patch"):
+                        try:
+                            result["git_diff"] = await env.get_current_patch()
+                        except Exception as patch_err:
+                            logger.warning(f"[SWEBenchOrchestra] get_current_patch failed: {patch_err}")
+                            result["git_diff"] = ""
 
                 history.append(StepRecord(
                     observation={},
@@ -336,6 +342,8 @@ class SWEBenchRunner(Runner):
                         "cost": result_data.get("cost", 0.0),
                         "finish_result": result_data.get("finish_result"),
                         "trace_summary": result_data.get("trace_summary", ""),
+                        "trace": result_data.get("trace", []),
+                        "git_diff": result_data.get("git_diff", ""),
                     }
                 elif action_name == "submit":
                     attempt["submit_result"] = {

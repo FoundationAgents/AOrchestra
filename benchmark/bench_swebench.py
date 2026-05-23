@@ -623,6 +623,23 @@ COMMAND
         await self._executor.cleanup()
         self._container_started = False
 
+    async def get_current_patch(self) -> str:
+        """Capture `git diff HEAD` from /testbed for trajectory archival.
+
+        Returns empty string if the container is gone or the command fails —
+        callers should treat absence as 'no patch available', not an error.
+        """
+        if not self._container_started:
+            return ""
+        try:
+            output, exit_code = await self._executor.execute_command(
+                "git -c core.fileMode=false diff HEAD",
+                workdir="/testbed",
+            )
+            return output if exit_code == 0 else ""
+        except Exception:
+            return ""
+
 
 class SWEBenchRunner(IncrementalRunner):
     """Runner for SWE-bench: incremental save + container cleanup."""
